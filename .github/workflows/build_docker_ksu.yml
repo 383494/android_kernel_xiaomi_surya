@@ -1,5 +1,4 @@
-name: Build Surya Kernel A16 (Docker + KSU)
-
+name: Build Surya Kernel
 on:
   workflow_dispatch:
 
@@ -27,69 +26,117 @@ jobs:
         ./antman -S
         ./antman --patch=glibc
 
-    - name: Setup KernelSU & Docker Configs
+    - name: Manual KernelSU Integration & Configs
       run: |
-        # 1. 集成最新 KernelSU
+        # --- 1. 手动集成 KernelSU (最稳妥的方式) ---
+        # 移除旧的集成尝试（如果有）
+        rm -rf drivers/kernelsu
+        
+        # 下载 KernelSU 源码 (使用 main 分支以支持最新 Android)
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
         
+        # 强制检查 drivers/Makefile，确保 obj-y 被添加
+        # 有时候脚本因为格式问题会失败，这里手动兜底
+        if ! grep -q "kernelsu" drivers/Makefile; then
+            echo "Manually patching drivers/Makefile..."
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+        fi
+        
+        # 强制检查 drivers/Kconfig
+        if ! grep -q "kernelsu" drivers/Kconfig; then
+            echo "Manually patching drivers/Kconfig..."
+            # 在 endmenu 前插入 source
+            sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
+        fi
+
+        # --- 2. 注入配置 (解决 Docker 依赖地狱) ---
         DEFCONFIG="arch/arm64/configs/surya_defconfig"
+        
+        # 定义配置修改函数
         set_config() {
+          # 先删除旧配置（防止重复或冲突）
           sed -i "/$1/d" $DEFCONFIG
+          # 追加新配置
           echo "$1=$2" >> $DEFCONFIG
         }
 
-        # --- KernelSU 增强配置 ---
+        echo "Injecting Critical Configs..."
+
+        # [基础依赖] 必须开启，否则后面的 IPC_NS 和 PID_NS 会失效！
+        set_config "CONFIG_SYSVIPC" "y"
+        set_config "CONFIG_NETFILTER_ADVANCED" "y"
+        set_config "CONFIG_EXPERT" "y"
+
+        # [KernelSU]
         set_config "CONFIG_KSU" "y"
         set_config "CONFIG_KSU_LSM_SECURITY_HOOKS" "y"
-        # 允许某些旧版 Hook 方式以兼容 Android 16
-        set_config "CONFIG_KSU_ALLOWLIST_WORKAROUND" "y"
+        set_config "CONFIG_LTO_CLANG" "n"  # 必须禁用 LTO，否则 KSU 符号被优化掉导致 Unsupported
 
-        # --- 补全 Docker 缺失的 Cgroup 控制器 ---
-        set_config "CONFIG_CGROUP_PIDS" "y"
+        # [Docker Namespaces - Critical]
+        set_config "CONFIG_NAMESPACES" "y"
+        set_config "CONFIG_NET_NS" "y"
+        set_config "CONFIG_PID_NS" "y"
+        set_config "CONFIG_IPC_NS" "y"
+        set_config "CONFIG_UTS_NS" "y"
+        set_config "CONFIG_USER_NS" "y"
+        set_config "CONFIG_POSIX_MQUEUE" "y"
+
+        # [Cgroups - Critical]
+        set_config "CONFIG_CGROUPS" "y"
         set_config "CONFIG_CGROUP_FREEZER" "y"
-        set_config "CONFIG_CGROUP_HUGETLB" "y"
+        set_config "CONFIG_CGROUP_PIDS" "y"
         set_config "CONFIG_CGROUP_DEVICE" "y"
-        set_config "CONFIG_CGROUP_CPUACCT" "y"
-        set_config "CONFIG_CGROUP_BPF" "y"
+        set_config "CONFIG_CPUSETS" "y"
         set_config "CONFIG_MEMCG" "y"
         set_config "CONFIG_MEMCG_SWAP" "y"
-        set_config "CONFIG_MEMCG_SWAP_ENABLED" "y"
-        set_config "CONFIG_CPU_CGROUP" "y"
-        set_config "CONFIG_FAIR_GROUP_SCHED" "y"
-        set_config "CONFIG_CFS_BANDWIDTH" "y"
-        set_config "CONFIG_RT_GROUP_SCHED" "y"
-        set_config "CONFIG_CPUSETS" "y"
+        set_config "CONFIG_BLK_CGROUP" "y"
+        set_config "CONFIG_CGROUP_SCHED" "y"
+        set_config "CONFIG_CGROUP_CPUACCT" "y"
+        set_config "CONFIG_CGROUP_BPF" "y"
 
-        # --- 补全 Docker 缺失的网络配置 ---
-        set_config "CONFIG_IP6_NF_NAT" "y"
-        set_config "CONFIG_IP6_NF_TARGET_MASQUERADE" "y"
-        set_config "CONFIG_IP_NF_TARGET_REDIRECT" "y"
+        # [Network - Critical]
+        set_config "CONFIG_BRIDGE" "y"
+        set_config "CONFIG_BRIDGE_NETFILTER" "y"
+        set_config "CONFIG_VETH" "y"
+        set_config "CONFIG_NETFILTER_XT_MATCH_ADDRTYPE" "y"
+        set_config "CONFIG_NETFILTER_XT_MATCH_CONNTRACK" "y"
         set_config "CONFIG_NETFILTER_XT_MATCH_IPVS" "y"
-        set_config "CONFIG_IP_VS" "y"
-        set_config "CONFIG_IP_VS_RR" "y"
-        set_config "CONFIG_IP_VS_NFCT" "y"
-        set_config "CONFIG_IP_VS_PROTO_TCP" "y"
-        set_config "CONFIG_IP_VS_PROTO_UDP" "y"
-        set_config "CONFIG_VXLAN" "y"
+        set_config "CONFIG_IP_NF_TARGET_MASQUERADE" "y"
+        set_config "CONFIG_IP6_NF_TARGET_MASQUERADE" "y"
+        set_config "CONFIG_IP_NF_NAT" "y"
+        set_config "CONFIG_NF_NAT" "y"
+        set_config "CONFIG_OVERLAY_FS" "y"
+
+        # [Docker Optional but Good]
         set_config "CONFIG_MACVLAN" "y"
         set_config "CONFIG_IPVLAN" "y"
-        set_config "CONFIG_BRIDGE_VLAN_FILTERING" "y"
-        set_config "CONFIG_NET_L3_MASTER_DEV" "y"
-
-        # --- 调试与兼容性 ---
+        set_config "CONFIG_VXLAN" "y"
+        
+        # [Debugging]
         set_config "CONFIG_IKCONFIG" "y"
         set_config "CONFIG_IKCONFIG_PROC" "y"
-        # 允许通过 cmdline 临时关闭 SELinux 强制模式 (以便测试 KSU)
-        set_config "CONFIG_SECURITY_SELINUX_DEVELOP" "y"
-        
+
     - name: Build Kernel
       run: |
         export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
         export ARCH=arm64
         export SUBARCH=arm64
         
-        # 使用现代 LLVM 编译方式
+        # 生成 .config
         make O=out surya_defconfig
+        
+        # --- 3. 二次检查 (Double Check) ---
+        # 有时候 defconfig 生成过程会根据依赖关系丢弃我们的配置
+        # 这里我们在编译前直接检查最终生成的 out/.config
+        # 如果发现 SYSVIPC 没开，再次强制开启，但这通常意味着 defconfig 修改成功了
+        if ! grep -q "CONFIG_SYSVIPC=y" out/.config; then
+            echo "WARNING: CONFIG_SYSVIPC was dropped! Forcing it in out/.config..."
+            echo "CONFIG_SYSVIPC=y" >> out/.config
+            # 重新生成以更新依赖
+            make O=out olddefconfig
+        fi
+
+        # 开始编译
         make -j$(nproc --all) O=out \
           LLVM=1 \
           LLVM_IAS=1 \
@@ -97,64 +144,44 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
           Image.gz-dtb dtbo.img
+
     - name: Package with AnyKernel3
       run: |
-        # 1. 克隆全新的 AnyKernel3
         git clone https://github.com/osm0sis/AnyKernel3.git
         rm -rf AnyKernel3/.git
         
-        # 2. 拷贝内核产物
         cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-        if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
-          cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-        fi
+        [ -f "out/arch/arm64/boot/dtbo.img" ] && cp out/arch/arm64/boot/dtbo.img AnyKernel3/
 
-        # 3. 【关键核心】直接重写 anykernel.sh，彻底抛弃 OMAP 模板
+        # 重写 anykernel.sh (使用精简版，避免 omap 错误和 /data 挂载错误)
         cat <<EOF > AnyKernel3/anykernel.sh
         # AnyKernel3 Ramdisk Mod Script
-        # osm0sis @ xda-developers
-
         properties() { '
-        kernel.string=Docker-KSU-Surya-A16
+        kernel.string=Docker-KSU-Surya-A16-Fixed
         do.devicecheck=0
         do.modules=0
-        do.systemless=1
+        do.systemless=0
         do.cleanup=1
         do.cleanuponabort=0
         '; }
 
-        # 设置 boot 分区为自动寻找
         BLOCK=auto;
         IS_SLOT_DEVICE=0;
         RAMDISK_COMPRESSION=auto;
         PATCH_VBMETA_FLAG=auto;
 
-        # 导入核心函数
         . tools/ak3-core.sh;
 
-        # 刷入内核
         split_boot;
         flash_boot;
-
-        # 如果存在 dtbo.img 则刷入
         flash_dtbo;
         EOF
-
-        # 4. 最终检查：确保文件里绝对没有 omap 字符串
-        echo "--- Final Check of anykernel.sh ---"
-        if grep -q "omap" AnyKernel3/anykernel.sh; then
-          echo "❌ ERROR: OMAP path still exists!"
-          exit 1
-        else
-          echo "✅ SUCCESS: anykernel.sh is clean."
-        fi
-
-        # 5. 打包
+        
         cd AnyKernel3
-        zip -r9 ../Surya-Docker-KSU-Kernel-A16.zip *
+        zip -r9 ../Surya-Docker-KSU-Final.zip *
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Surya-Docker-KSU-Kernel-A16
-        path: Surya-Docker-KSU-Kernel-A16.zip
+        name: Surya-Docker-KSU-Final
+        path: Surya-Docker-KSU-Final.zip
