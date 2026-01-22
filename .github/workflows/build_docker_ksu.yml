@@ -28,58 +28,54 @@ jobs:
 
     - name: Manual KernelSU Integration & Configs
       run: |
-        # --- 1. 清理现场 (防止之前的 Patch 残留) ---
-        # 这一步非常关键！必须撤销 setup.sh 可能做过的源码修改
-        git checkout .
-        git clean -fdX
+        # --- 1. 获取 KernelSU 源码 (修正目录结构) ---
+        # 先下载到临时目录，再提取我们需要的部分
+        # 这样可以确保 drivers/kernelsu/ksu.c 直接存在，而不是在子目录下
+        rm -rf ksu_temp
+        git clone --depth=1 https://github.com/tiann/KernelSU ksu_temp
         
-        # --- 2. 手动克隆 KernelSU (不使用 setup.sh) ---
-        # 直接克隆源码，不让脚本去乱改内核文件
+        # 建立目录并移动核心代码
         rm -rf drivers/kernelsu
-        git clone https://github.com/tiann/KernelSU drivers/kernelsu
+        mkdir -p drivers/kernelsu
+        cp -r ksu_temp/kernel/* drivers/kernelsu/
+        rm -rf ksu_temp
+
+        # --- 2. 手动注册驱动 (不使用 setup.sh 以避免污染内核源码) ---
+        # 这里的关键是：只让 KSU 作为模块参与编译，不修改 fs/exec.c 等原生文件
+        # 从而彻底避开 "undefined symbol: ksu_input_hook" 等链接错误
         
-        # --- 3. 手动注册驱动 ---
-        # 既然不用 setup.sh，我们需要手动把 KSU 加入构建系统
-        # 检查并添加 obj-y += kernelsu/ 到 drivers/Makefile
+        # 修改 drivers/Makefile
         if ! grep -q "kernelsu" drivers/Makefile; then
             echo "obj-y += kernelsu/" >> drivers/Makefile
         fi
         
-        # 检查并添加 source "drivers/kernelsu/Kconfig" 到 drivers/Kconfig
+        # 修改 drivers/Kconfig
         if ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
         fi
 
-        # --- 4. 应用代码兼容性补丁 (针对 4.14 内核) ---
-        # 即使是 Kprobes 模式，这些 C 代码错误依然需要修复
+        # --- 3. 针对 Android 4.14 内核的兼容性修复 (必做) ---
         
-        # [Patch 1] ksu.c: 修复 MODULE_IMPORT_NS
+        # [Patch 1] ksu.c: 修复 4.14 没有 MODULE_IMPORT_NS 的报错
         sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
 
-        # [Patch 2] allowlist.c: 修复 TWA_RESUME 和缺头文件
+        # [Patch 2] allowlist.c: 修复 TWA_RESUME 未定义和 put_task_struct 头文件缺失
         sed -i '1i #include <linux/version.h>\n#include <linux/sched.h>\n#include <linux/sched/task.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
 
-        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 缺失
+        # [Patch 3] sucompat.c: 修复 4.14 没有 linux/pgtable.h 的问题 (应为 linux/mm.h)
         sed -i 's|#include <linux/pgtable.h>|#include <linux/mm.h>|g' drivers/kernelsu/sucompat.c
-        
-        # [Patch 4] input_hook.c: 修复 input_handle 结构体变化 (4.14 可能遇到)
-        # 如果之后还报 input_handle 错误，可能需要这个，暂时先不加，视情况而定
 
-        # --- 5. 准备编译环境 ---
-        make mrproper
-        rm -rf out
-        mkdir -p out
-
-        # --- 6. 生成 Docker & KSU 配置文件 ---
+        # --- 4. 生成 Docker + KSU 配置文件 ---
+        # 注意：4.14 内核必须开启 KPROBES 才能让 KSU 正常工作
         cat <<EOF > docker_ksu.config
-        # KernelSU (启用 Kprobes 模式)
+        # [KernelSU - Kprobe 模式]
         CONFIG_KSU=y
         CONFIG_KPROBES=y
         CONFIG_HAVE_KPROBES=y
         CONFIG_KPROBE_EVENTS=y
         CONFIG_OVERLAY_FS=y
 
-        # Docker 核心
+        # [Docker 核心支持]
         CONFIG_NAMESPACES=y
         CONFIG_UTS_NS=y
         CONFIG_IPC_NS=y
@@ -88,6 +84,8 @@ jobs:
         CONFIG_NET_NS=y
         CONFIG_SYSVIPC=y
         CONFIG_POSIX_MQUEUE=y
+        
+        # [Cgroups 支持]
         CONFIG_CGROUPS=y
         CONFIG_MEMCG=y
         CONFIG_MEMCG_SWAP=y
@@ -100,7 +98,7 @@ jobs:
         CONFIG_CGROUP_CPUACCT=y
         CONFIG_CGROUP_BPF=y
 
-        # 网络
+        # [网络支持 - 修复 Bridge/IPVS missing]
         CONFIG_BRIDGE=y
         CONFIG_BRIDGE_NETFILTER=y
         CONFIG_VETH=y
@@ -114,15 +112,22 @@ jobs:
         CONFIG_IP_NF_TARGET_MASQUERADE=y
         CONFIG_NF_NAT_IPV4=y
 
-        # 解决 Android 4.14 网络权限问题
+        # [解决 Android 特有网络限制]
         # CONFIG_ANDROID_PARANOID_NETWORK is not set
 
-        # 禁用 LTO (至关重要)
+        # [禁用 LTO] 
+        # 必须禁用，否则 KPROBES 找不到符号，KSU 会提示未安装
         # CONFIG_LTO_CLANG is not set
         # CONFIG_LTO_CLANG_THIN is not set
         EOF
 
-        # --- 7. 合并配置 ---
+        # --- 5. 合并配置 ---
+        # 确保 out 目录存在
+        rm -rf out
+        mkdir -p out
+        
+        # 使用 merge_config.sh 将 docker_ksu.config 合并到默认配置中
+        # 结果输出到 out/.config
         ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_ksu.config
 
     - name: Build Kernel
