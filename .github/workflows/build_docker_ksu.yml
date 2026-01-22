@@ -38,18 +38,15 @@ jobs:
         cp -r ksu_temp/kernel/* drivers/kernelsu/
         rm -rf ksu_temp
 
-        # --- 2. 手动注册驱动 (不使用 setup.sh) ---
-        # 避免修改内核源码导致 "undefined symbol" 链接错误
-        
+        # --- 2. 手动注册驱动 ---
         if ! grep -q "kernelsu" drivers/Makefile; then
             echo "obj-y += kernelsu/" >> drivers/Makefile
         fi
-        
         if ! grep -q "kernelsu" drivers/Kconfig; then
             sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
         fi
 
-        # --- 3. 针对 Android 4.14 内核的兼容性修复 (累积补丁) ---
+        # --- 3. 针对 Android 4.14 内核的兼容性修复 (全集) ---
         
         # [Patch 1] ksu.c: 修复 4.14 没有 MODULE_IMPORT_NS
         sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
@@ -57,12 +54,12 @@ jobs:
         # [Patch 2] allowlist.c: 修复 TWA_RESUME 和缺头文件
         sed -i '1i #include <linux/version.h>\n#include <linux/sched.h>\n#include <linux/sched/task.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
 
-        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 缺失
+        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 缺失 (应为 linux/mm.h)
         sed -i 's|#include <linux/pgtable.h>|#include <linux/mm.h>|g' drivers/kernelsu/sucompat.c
 
-        # [Patch 4 - NEW!] syscall_hook_manager.c: 修复 strncpy_from_user_nofault 未定义
-        # 4.14 内核直接使用 standard strncpy_from_user
-        sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n#define strncpy_from_user_nofault(dst, src, count) strncpy_from_user(dst, src, count)\n#endif' drivers/kernelsu/syscall_hook_manager.c
+        # [Patch 4 - FIXED] syscall_hook_manager.c: 修复 strncpy_from_user_nofault
+        # 增加 #include <linux/uaccess.h> 以解决 implicit declaration 错误
+        sed -i '1i #include <linux/version.h>\n#include <linux/uaccess.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n#define strncpy_from_user_nofault(dst, src, count) strncpy_from_user(dst, src, count)\n#endif' drivers/kernelsu/syscall_hook_manager.c
 
         # --- 4. 生成 Docker + KSU 配置文件 ---
         cat <<EOF > docker_ksu.config
@@ -110,7 +107,7 @@ jobs:
         CONFIG_IP_NF_TARGET_MASQUERADE=y
         CONFIG_NF_NAT_IPV4=y
 
-        # [解决 Android 特有网络限制]
+        # [Android 网络修复]
         # CONFIG_ANDROID_PARANOID_NETWORK is not set
 
         # [禁用 LTO] 
