@@ -102,11 +102,15 @@ jobs:
         # 1. 生成基础配置
         make O=out surya_defconfig
 
-        # 2. 准备 Docker 强制配置 (增加 EXPERT 和 STAGING)
-        # 使用更激进的配置集
+        # 2. 准备 Docker 强制配置 (补全了 SYSVIPC)
         cat <<EOF > docker_forced.config
+        # --- 核心依赖 (缺一不可) ---
         CONFIG_EXPERT=y
         CONFIG_EMBEDDED=n
+        CONFIG_SYSVIPC=y
+        CONFIG_POSIX_MQUEUE=y
+        
+        # --- Cgroups ---
         CONFIG_CGROUPS=y
         CONFIG_CGROUP_DEVICE=y
         CONFIG_CGROUP_FREEZER=y
@@ -115,12 +119,16 @@ jobs:
         CONFIG_CPUSETS=y
         CONFIG_MEMCG=y
         CONFIG_MEMCG_SWAP=y
+        
+        # --- Namespaces ---
         CONFIG_NAMESPACES=y
         CONFIG_UTS_NS=y
         CONFIG_IPC_NS=y
         CONFIG_USER_NS=y
         CONFIG_PID_NS=y
         CONFIG_NET_NS=y
+        
+        # --- Network ---
         CONFIG_NETFILTER=y
         CONFIG_NETFILTER_ADVANCED=y
         CONFIG_BRIDGE=y
@@ -134,37 +142,54 @@ jobs:
         CONFIG_MACVLAN=y
         CONFIG_IPVLAN=y
         CONFIG_VXLAN=y
-        # 禁用偏执网络限制
+        
+        # --- Security / Misc ---
         CONFIG_ANDROID_PARANOID_NETWORK=n
         EOF
 
-        # 3. 暴力追加配置 (比 merge_config 更强硬)
+        # 3. 暴力追加配置
         echo "Appending Docker config to out/.config..."
         cat docker_forced.config >> out/.config
 
         # 4. 刷新依赖 (olddefconfig)
-        # 这步会重新计算依赖，如果 CONFIG_CGROUP_DEVICE 依赖 EXPERT，现在 EXPERT 已开启，它应该会被保留
         make O=out LLVM=1 LLVM_IAS=1 olddefconfig
 
         # 5. 生死检查 (Life or Death Check)
-        # 编译前必须确认关键配置存在，否则直接报错退出
-        echo "Checking for CONFIG_CGROUP_DEVICE..."
-        if grep -q "CONFIG_CGROUP_DEVICE=y" out/.config; then
-            echo "✅ CONFIG_CGROUP_DEVICE is ENABLED."
+        echo "=== FINAL CONFIG CHECK ==="
+        
+        # 检查 SYSVIPC (IPC_NS 的爹)
+        if grep -q "CONFIG_SYSVIPC=y" out/.config; then
+            echo "✅ CONFIG_SYSVIPC is ENABLED."
         else
-            echo "❌ ERROR: CONFIG_CGROUP_DEVICE was dropped by Kconfig!"
-            echo "Dumping related configs for debugging:"
-            grep "CGROUP" out/.config || true
+            echo "❌ ERROR: CONFIG_SYSVIPC missing! This is why IPC_NS fails."
             exit 1
         fi
 
-        echo "Checking for CONFIG_IPC_NS..."
+        # 检查 IPC_NS
         if grep -q "CONFIG_IPC_NS=y" out/.config; then
             echo "✅ CONFIG_IPC_NS is ENABLED."
         else
             echo "❌ ERROR: CONFIG_IPC_NS missing!"
             exit 1
         fi
+
+        # 检查 PID_NS
+        if grep -q "CONFIG_PID_NS=y" out/.config; then
+            echo "✅ CONFIG_PID_NS is ENABLED."
+        else
+            echo "❌ ERROR: CONFIG_PID_NS missing!"
+            exit 1
+        fi
+        
+        # 检查 CGROUP_DEVICE
+        if grep -q "CONFIG_CGROUP_DEVICE=y" out/.config; then
+            echo "✅ CONFIG_CGROUP_DEVICE is ENABLED."
+        else
+            echo "❌ ERROR: CONFIG_CGROUP_DEVICE missing!"
+            exit 1
+        fi
+
+        echo "All critical configs verified. Building..."
 
         # 6. 开始编译
         make -j$(nproc --all) O=out \
