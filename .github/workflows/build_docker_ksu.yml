@@ -28,69 +28,71 @@ jobs:
 
     - name: Manual KernelSU Integration & Configs
       run: |
-        # 1. 集成 KernelSU
+        # 1. 下载 KernelSU
         rm -rf drivers/kernelsu
         curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
 
-        # 2. 彻底清理源码目录，确保没有残留产物
+        # --- 修复 4.14 内核不支持 MODULE_IMPORT_NS 的问题 ---
+        # 在 ksu.c 的开头注入宏定义，如果内核版本小于 5.4，则将 MODULE_IMPORT_NS 定义为空
+        sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
+
+        # 2. 彻底清理源码目录
         make mrproper
         rm -rf out
         mkdir -p out
 
-        # 3. 创建 Docker 配置补丁
+        # 3. 创建 Docker 配置补丁 (额外增加了几个 4.14 运行 Docker 建议的配置)
         cat <<EOF > docker_ksu.config
-        CONFIG_SYSVIPC=y
-        CONFIG_POSIX_MQUEUE=y
-        CONFIG_EXPERT=y
-        CONFIG_NETFILTER_ADVANCED=y
         CONFIG_KSU=y
+        # 4.14 必须开启 KPROBES，否则 KSU 无法工作
         CONFIG_KPROBES=y
         CONFIG_HAVE_KPROBES=y
         CONFIG_KPROBE_EVENTS=y
-        CONFIG_OVERLAY_FS=y
+
+        # Docker 基础组件
+        CONFIG_SYSVIPC=y
+        CONFIG_POSIX_MQUEUE=y
         CONFIG_NAMESPACES=y
-        CONFIG_UTS_NS=y
-        CONFIG_IPC_NS=y
         CONFIG_USER_NS=y
         CONFIG_PID_NS=y
+        CONFIG_IPC_NS=y
         CONFIG_NET_NS=y
+        CONFIG_UTS_NS=y
+
+        # Cgroups (Android 4.14 常用)
         CONFIG_CGROUPS=y
-        CONFIG_CGROUP_FREEZER=y
-        CONFIG_CGROUP_PIDS=y
-        CONFIG_CGROUP_DEVICE=y
-        CONFIG_CPUSETS=y
-        CONFIG_PROC_PID_CPUSET=y
         CONFIG_MEMCG=y
         CONFIG_MEMCG_SWAP=y
         CONFIG_BLK_CGROUP=y
         CONFIG_CGROUP_SCHED=y
-        CONFIG_FAIR_GROUP_SCHED=y
-        CONFIG_CFS_BANDWIDTH=y
-        CONFIG_RT_GROUP_SCHED=y
+        CONFIG_CGROUP_PIDS=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CPUSETS=y
         CONFIG_CGROUP_CPUACCT=y
-        CONFIG_CGROUP_BPF=y
+
+        # 网络组件 (Docker 必须)
         CONFIG_BRIDGE=y
         CONFIG_BRIDGE_NETFILTER=y
-        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
         CONFIG_VETH=y
+        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
         CONFIG_IP_NF_TARGET_MASQUERADE=y
-        CONFIG_IP6_NF_TARGET_MASQUERADE=y
         CONFIG_NETFILTER_XT_MARK=y
+        CONFIG_NETFILTER_XT_MATCH_IPVS=y
         CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
         CONFIG_IP_NF_NAT=y
-        CONFIG_IP6_NF_NAT=y
+        CONFIG_NF_NAT_IPV4=y
+        CONFIG_OVERLAY_FS=y
+
+        # 解决 Android 4.14 特有的“只有 Root 能上网”问题
+        # CONFIG_ANDROID_PARANOID_NETWORK is not set
+        
+        # 禁用 LTO 保证 KSU 符号不被优化
         # CONFIG_LTO_CLANG is not set
-        # CONFIG_LTO_CLANG_THIN is not set
         EOF
 
-        # 4. 使用 merge_config.sh 合并配置
-        # 注意：这里我们手动把生成的 .config 定向到 out 目录下
+        # 4. 合并配置
         ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_ksu.config
-        
-        # 5. 再次清理源码根目录（防止 merge_config 意外留下垃圾）
-        # 这一步非常重要，确保源码树绝对干净
-        git checkout arch/arm64/configs/surya_defconfig
-        rm -f .config docker_ksu.config
 
     - name: Build Kernel
       run: |
