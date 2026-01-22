@@ -28,9 +28,10 @@ jobs:
 
     - name: Manual KernelSU Integration & Configs
       run: |
-        # --- 1. 获取 KernelSU 源码 ---
+        # --- 1. 获取 KernelSU 源码 (指定 v0.9.5 版本) ---
         rm -rf ksu_temp
-        git clone --depth=1 https://github.com/tiann/KernelSU ksu_temp
+        # 使用 --branch v0.9.5 锁定版本
+        git clone --depth=1 --branch v0.9.5 https://github.com/tiann/KernelSU ksu_temp
         
         # 建立目录并移动核心代码
         rm -rf drivers/kernelsu
@@ -46,20 +47,14 @@ jobs:
             sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
         fi
 
-        # --- 3. 针对 Android 4.14 内核的兼容性修复 (全集) ---
+        # --- 3. 针对 v0.9.5 + 4.14 内核的极简修复 ---
+        # v0.9.5 对旧内核支持较好，通常只需要修复 MODULE_IMPORT_NS
         
         # [Patch 1] ksu.c: 修复 4.14 没有 MODULE_IMPORT_NS
         sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
 
-        # [Patch 2] allowlist.c: 修复 TWA_RESUME 和缺头文件
-        sed -i '1i #include <linux/version.h>\n#include <linux/sched.h>\n#include <linux/sched/task.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
-
-        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 缺失 (应为 linux/mm.h)
-        sed -i 's|#include <linux/pgtable.h>|#include <linux/mm.h>|g' drivers/kernelsu/sucompat.c
-
-        # [Patch 4 - FIXED] syscall_hook_manager.c: 修复 strncpy_from_user_nofault
-        # 增加 #include <linux/uaccess.h> 以解决 implicit declaration 错误
-        sed -i '1i #include <linux/version.h>\n#include <linux/uaccess.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)\n#define strncpy_from_user_nofault(dst, src, count) strncpy_from_user(dst, src, count)\n#endif' drivers/kernelsu/syscall_hook_manager.c
+        # 注意：v0.9.5 不需要修复 pkg_observer (没有这个文件) 或 syscall_hook (老版实现不同)
+        # 这大大降低了编译失败的概率
 
         # --- 4. 生成 Docker + KSU 配置文件 ---
         cat <<EOF > docker_ksu.config
@@ -111,6 +106,7 @@ jobs:
         # CONFIG_ANDROID_PARANOID_NETWORK is not set
 
         # [禁用 LTO] 
+        # v0.9.5 同样建议禁用 LTO 以避免 Kprobes 符号丢失
         # CONFIG_LTO_CLANG is not set
         # CONFIG_LTO_CLANG_THIN is not set
         EOF
