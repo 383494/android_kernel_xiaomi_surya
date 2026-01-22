@@ -28,38 +28,58 @@ jobs:
 
     - name: Manual KernelSU Integration & Configs
       run: |
-        # 1. 下载 KernelSU (main 分支)
-        rm -rf drivers/kernelsu
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
-
-        # --- KernelSU 针对 Android 4.14 内核的终极兼容性补丁 ---
+        # --- 1. 清理现场 (防止之前的 Patch 残留) ---
+        # 这一步非常关键！必须撤销 setup.sh 可能做过的源码修改
+        git checkout .
+        git clean -fdX
         
-        # [Patch 1] ksu.c: 修复 MODULE_IMPORT_NS 缺失 (4.14 无此功能)
+        # --- 2. 手动克隆 KernelSU (不使用 setup.sh) ---
+        # 直接克隆源码，不让脚本去乱改内核文件
+        rm -rf drivers/kernelsu
+        git clone https://github.com/tiann/KernelSU drivers/kernelsu
+        
+        # --- 3. 手动注册驱动 ---
+        # 既然不用 setup.sh，我们需要手动把 KSU 加入构建系统
+        # 检查并添加 obj-y += kernelsu/ 到 drivers/Makefile
+        if ! grep -q "kernelsu" drivers/Makefile; then
+            echo "obj-y += kernelsu/" >> drivers/Makefile
+        fi
+        
+        # 检查并添加 source "drivers/kernelsu/Kconfig" 到 drivers/Kconfig
+        if ! grep -q "kernelsu" drivers/Kconfig; then
+            sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
+        fi
+
+        # --- 4. 应用代码兼容性补丁 (针对 4.14 内核) ---
+        # 即使是 Kprobes 模式，这些 C 代码错误依然需要修复
+        
+        # [Patch 1] ksu.c: 修复 MODULE_IMPORT_NS
         sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
 
-        # [Patch 2] allowlist.c: 修复 TWA_RESUME 未定义和 put_task_struct 缺头文件
-        # 4.14 的 task_work_add 使用 bool 类型，这里定义 TWA_RESUME 为 1 (true) 以适配
+        # [Patch 2] allowlist.c: 修复 TWA_RESUME 和缺头文件
         sed -i '1i #include <linux/version.h>\n#include <linux/sched.h>\n#include <linux/sched/task.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 9, 0)\n#define TWA_RESUME 1\n#endif' drivers/kernelsu/allowlist.c
 
-        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 不存在的问题
-        # 4.14 内核应使用 linux/mm.h
+        # [Patch 3] sucompat.c: 修复 linux/pgtable.h 缺失
         sed -i 's|#include <linux/pgtable.h>|#include <linux/mm.h>|g' drivers/kernelsu/sucompat.c
+        
+        # [Patch 4] input_hook.c: 修复 input_handle 结构体变化 (4.14 可能遇到)
+        # 如果之后还报 input_handle 错误，可能需要这个，暂时先不加，视情况而定
 
-        # --- 环境清理 ---
+        # --- 5. 准备编译环境 ---
         make mrproper
         rm -rf out
         mkdir -p out
 
-        # --- Docker & KernelSU 配置文件 (docker_ksu.config) ---
+        # --- 6. 生成 Docker & KSU 配置文件 ---
         cat <<EOF > docker_ksu.config
-        # KernelSU
+        # KernelSU (启用 Kprobes 模式)
         CONFIG_KSU=y
         CONFIG_KPROBES=y
         CONFIG_HAVE_KPROBES=y
         CONFIG_KPROBE_EVENTS=y
         CONFIG_OVERLAY_FS=y
 
-        # Docker 核心 Namespaces
+        # Docker 核心
         CONFIG_NAMESPACES=y
         CONFIG_UTS_NS=y
         CONFIG_IPC_NS=y
@@ -68,8 +88,6 @@ jobs:
         CONFIG_NET_NS=y
         CONFIG_SYSVIPC=y
         CONFIG_POSIX_MQUEUE=y
-
-        # Cgroups
         CONFIG_CGROUPS=y
         CONFIG_MEMCG=y
         CONFIG_MEMCG_SWAP=y
@@ -96,17 +114,15 @@ jobs:
         CONFIG_IP_NF_TARGET_MASQUERADE=y
         CONFIG_NF_NAT_IPV4=y
 
-        # 解决 Android 特有的网络权限限制 (Paranoid Network)
+        # 解决 Android 4.14 网络权限问题
         # CONFIG_ANDROID_PARANOID_NETWORK is not set
 
-        # 禁用 LTO (Link Time Optimization)
-        # LTO 会导致 KernelSU 的符号 hook 失败，必须禁用
+        # 禁用 LTO (至关重要)
         # CONFIG_LTO_CLANG is not set
         # CONFIG_LTO_CLANG_THIN is not set
         EOF
 
-        # --- 合并配置 ---
-        # 自动处理依赖关系，并生成最终的 out/.config
+        # --- 7. 合并配置 ---
         ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_ksu.config
 
     - name: Build Kernel
