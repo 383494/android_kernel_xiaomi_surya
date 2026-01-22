@@ -92,38 +92,6 @@ jobs:
         CONFIG_IKCONFIG_PROC=y
         EOF
 
-    - name: Pre-check AnyKernel3 Logic (Fail Fast)
-      run: |
-        # 1. 克隆 AnyKernel3
-        git clone https://github.com/osm0sis/AnyKernel3.git
-        cd AnyKernel3
-        
-        # 2. 修正 sed 命令 (改用大写 BLOCK 并使用正则匹配)
-        # ^BLOCK=.* 匹配以 BLOCK= 开头的整行
-        sed -i 's|^BLOCK=.*|BLOCK=auto;|g' anykernel.sh
-        
-        # 3. 修正设备检查开关 (properties 函数内的小写项)
-        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
-        
-        # 4. 校验结果
-        echo "--- Checking anykernel.sh content ---"
-        if grep -q "BLOCK=auto;" anykernel.sh; then
-            echo "✅ SUCCESS: BLOCK partition set to auto."
-        else
-            echo "❌ ERROR: Failed to modify BLOCK path. Check anykernel.sh content above."
-            grep "BLOCK=" anykernel.sh || true
-            exit 1
-        fi
-
-        if grep -q "do.devicecheck=0" anykernel.sh; then
-            echo "✅ SUCCESS: Device check disabled."
-        else
-            echo "❌ ERROR: Failed to disable device check."
-            exit 1
-        fi
-        
-        cd ..
-
     - name: Build Kernel
       run: |
         export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
@@ -139,22 +107,60 @@ jobs:
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
           Image.gz-dtb dtbo.img
-
     - name: Package with AnyKernel3
       run: |
-        # 进入之前已经修改并校验过的目录
-        cd AnyKernel3
+        # 1. 克隆全新的 AnyKernel3
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/.git
         
-        # 拷贝编译产物
-        cp ../out/arch/arm64/boot/Image.gz-dtb .
-        if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
-          cp ../out/arch/arm64/boot/dtbo.img .
+        # 2. 拷贝内核产物
+        cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
+          cp out/arch/arm64/boot/dtbo.img AnyKernel3/
         fi
-        
-        # 修改内核名称标识（这一步不影响刷入，可做可不做）
-        sed -i 's/kernel.string=.*/kernel.string=Docker-KSU-Surya-A16/g' anykernel.sh
-        
-        # 直接打包
+
+        # 3. 【关键核心】直接重写 anykernel.sh，彻底抛弃 OMAP 模板
+        cat <<EOF > AnyKernel3/anykernel.sh
+        # AnyKernel3 Ramdisk Mod Script
+        # osm0sis @ xda-developers
+
+        properties() { '
+        kernel.string=Docker-KSU-Surya-A16
+        do.devicecheck=0
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        '; }
+
+        # 设置 boot 分区为自动寻找
+        BLOCK=auto;
+        IS_SLOT_DEVICE=0;
+        RAMDISK_COMPRESSION=auto;
+        PATCH_VBMETA_FLAG=auto;
+
+        # 导入核心函数
+        . tools/ak3-core.sh;
+
+        # 刷入内核
+        split_boot;
+        flash_boot;
+
+        # 如果存在 dtbo.img 则刷入
+        flash_dtbo;
+        EOF
+
+        # 4. 最终检查：确保文件里绝对没有 omap 字符串
+        echo "--- Final Check of anykernel.sh ---"
+        if grep -q "omap" AnyKernel3/anykernel.sh; then
+          echo "❌ ERROR: OMAP path still exists!"
+          exit 1
+        else
+          echo "✅ SUCCESS: anykernel.sh is clean."
+        fi
+
+        # 5. 打包
+        cd AnyKernel3
         zip -r9 ../Surya-Docker-KSU-Kernel-A16.zip *
 
     - name: Upload Artifact
