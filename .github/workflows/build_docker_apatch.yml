@@ -1,0 +1,175 @@
+name: Build Surya Kernel (APatch)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    
+    steps:
+    - name: Checkout Source
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 1
+
+    - name: Setup Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git ccache automake flex lzop bison gperf build-essential zip curl zlib1g-dev libxml2-utils bzip2 libbz2-dev libbz2-1.0 libghc-bzlib-dev squashfs-tools pngcrush schedtool dpkg-dev liblz4-tool make optipng maven libssl-dev pwgen libswitch-perl policycoreutils minicom libxml-simple-perl bc libc6-dev-i386 lib32ncurses5-dev libx11-dev lib32z1-dev libgl1-mesa-dev xsltproc unzip device-tree-compiler python3 python-is-python3 gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+    - name: Setup Neutron Clang
+      run: |
+        mkdir -p clang
+        cd clang
+        curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+        chmod +x antman
+        ./antman -S
+        ./antman --patch=glibc
+
+    - name: Kernel Configs (Docker + APatch Dependencies)
+      run: |
+        # 1. 彻底清理源码目录，防止 "source is not clean" 错误
+        make mrproper
+        rm -rf out
+        mkdir -p out
+
+        # 2. 创建 Docker 和 APatch 所需的配置片段
+        cat <<EOF > docker_apatch.config
+        # --- Docker 核心依赖 (Namespaces) ---
+        CONFIG_NAMESPACES=y
+        CONFIG_UTS_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_USER_NS=y
+        CONFIG_PID_NS=y
+        CONFIG_NET_NS=y
+        CONFIG_SYSVIPC=y
+        CONFIG_POSIX_MQUEUE=y
+
+        # --- Cgroups (Docker 必须) ---
+        CONFIG_CGROUPS=y
+        CONFIG_MEMCG=y
+        CONFIG_MEMCG_SWAP=y
+        CONFIG_MEMCG_SWAP_ENABLED=y
+        CONFIG_BLK_CGROUP=y
+        CONFIG_CGROUP_SCHED=y
+        CONFIG_CGROUP_PIDS=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CPUSETS=y
+        CONFIG_CGROUP_CPUACCT=y
+        CONFIG_CGROUP_BPF=y
+        CONFIG_CFS_BANDWIDTH=y
+
+        # --- 网络与防火墙 (解决 Docker 脚本 missing 项) ---
+        CONFIG_BRIDGE=y
+        CONFIG_BRIDGE_NETFILTER=y
+        CONFIG_VETH=y
+        CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+        CONFIG_NETFILTER_XT_MARK=y
+        CONFIG_NETFILTER_XT_MATCH_CONNTRACK=y
+        CONFIG_NETFILTER_XT_MATCH_IPVS=y
+        CONFIG_NETFILTER_XT_MATCH_BPF=y
+        CONFIG_IP_VS=y
+        CONFIG_IP_VS_RR=y
+        CONFIG_IP_NF_NAT=y
+        CONFIG_IP_NF_TARGET_MASQUERADE=y
+        CONFIG_NF_NAT_IPV4=y
+        CONFIG_IP6_NF_TARGET_MASQUERADE=y
+        CONFIG_OVERLAY_FS=y
+
+        # --- APatch 所需依赖 (Kprobes) ---
+        CONFIG_KPROBES=y
+        CONFIG_HAVE_KPROBES=y
+        CONFIG_KPROBE_EVENTS=y
+        CONFIG_DYNAMIC_FTRACE=y
+
+        # --- 兼容性优化 ---
+        # 禁用 LTO 以防止 APatch 注入点被优化掉，同时加快编译速度
+        # CONFIG_LTO_CLANG is not set
+        # CONFIG_LTO_CLANG_THIN is not set
+        # 允许 Docker 容器访问网络
+        # CONFIG_ANDROID_PARANOID_NETWORK is not set
+        EOF
+
+        # 3. 使用官方脚本合并配置到 out/.config
+        ARCH=arm64 scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_apatch.config
+
+    - name: Build Kernel
+      run: |
+        export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
+        
+        # 补全合并后可能缺失的默认依赖配置
+        make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+        
+        # 开始编译
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 \
+          CC=clang \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
+          LLVM=1 \
+          LLVM_IAS=1 \
+          LOCALVERSION="-Docker-APatch" \
+          Image.gz-dtb dtbo.img
+
+    - name: Patch Kernel with APatch
+      run: |
+        # 下载 APatch 注入工具 kptools
+        curl -L -o kptools https://github.com/bmax121/APatch/releases/download/v1.0.7/kptools-linux-x86_64
+        chmod +x kptools
+
+        # 定义 SuperKey (刷入后在 APatch Manager App 中输入此 Key 即可获得 Root)
+        # 注意：Key 长度建议 8 位以上字母数字
+        SUPERKEY="x383494x"
+
+        # 对编译好的内核镜像进行二进制注入
+        # 这种方式无需修改内核源码，完美避开 4.14 编译报错
+        ./kptools --image out/arch/arm64/boot/Image.gz-dtb --patch --kp --key "$SUPERKEY"
+        
+        echo "APatch injection successful with SuperKey: $SUPERKEY"
+
+    - name: Package with AnyKernel3
+      run: |
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        rm -rf AnyKernel3/.git
+        
+        # 复制注入后的 Image 和 DTBO
+        cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        [ -f "out/arch/arm64/boot/dtbo.img" ] && cp out/arch/arm64/boot/dtbo.img AnyKernel3/
+
+        # 生成 anykernel.sh
+        cat <<EOF > AnyKernel3/anykernel.sh
+        # AnyKernel3 Ramdisk Mod Script
+        properties() { '
+        kernel.string=Docker-APatch-Surya-A16
+        do.devicecheck=1
+        do.modules=0
+        do.systemless=1
+        do.cleanup=1
+        do.cleanuponabort=0
+        device.name1=surya
+        device.name2=karna
+        '; }
+
+        BLOCK=auto;
+        IS_SLOT_DEVICE=0;
+        RAMDISK_COMPRESSION=auto;
+        PATCH_VBMETA_FLAG=auto;
+
+        . tools/ak3-core.sh;
+
+        split_boot;
+        flash_boot;
+        flash_dtbo;
+        EOF
+        
+        cd AnyKernel3
+        zip -r9 ../Surya-Docker-APatch-Kernel.zip *
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: Surya-Docker-APatch-Kernel
+        path: Surya-Docker-APatch-Kernel.zip
