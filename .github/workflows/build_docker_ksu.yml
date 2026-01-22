@@ -141,21 +141,29 @@ jobs:
 
     - name: Package with AnyKernel3
       run: |
-        git clone https://github.com/kdrag0n/AnyKernel3.git
+        # 修复：切换到官方源 (osm0sis)，因为 kdrag0n 的仓库已失效
+        git clone https://github.com/osm0sis/AnyKernel3.git
         
+        # 移除 .git 目录以保持纯净
+        rm -rf AnyKernel3/.git
+
+        # 复制内核镜像
         cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
+        
         # 复制 dtbo.img (如果存在)
         if [ -f "out/arch/arm64/boot/dtbo.img" ]; then
           cp out/arch/arm64/boot/dtbo.img AnyKernel3/dtbo.img
         fi
 
         cd AnyKernel3
-        # 禁用设备检查，防止型号识别错误
+        
+        # 禁用设备检查，防止 AnyKernel 脚本报错
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+        
+        # 修改内核名称标识
         sed -i 's/kernel.string=.*/kernel.string=Docker-KSU-Surya-A16/g' anykernel.sh
         
-        # 清理 git 文件夹
-        rm -rf .git
+        # 打包 Zip
         zip -r9 ../Surya-Docker-KSU-Kernel-A16.zip *
 
     - name: Upload Artifact
