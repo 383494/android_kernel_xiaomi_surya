@@ -94,22 +94,24 @@ jobs:
 
     - name: Pre-check AnyKernel3 Logic (Fail Fast)
       run: |
-        # 提前克隆 AnyKernel3 进行逻辑校验
+        # 1. 克隆 AnyKernel3
         git clone https://github.com/osm0sis/AnyKernel3.git
         cd AnyKernel3
         
-        # 1. 执行修改：强制将 block 路径改为 auto
-        # 注意：这里使用精准匹配原始字符串，确保替换成功
-        sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' anykernel.sh
+        # 2. 修正 sed 命令 (改用大写 BLOCK 并使用正则匹配)
+        # ^BLOCK=.* 匹配以 BLOCK= 开头的整行
+        sed -i 's|^BLOCK=.*|BLOCK=auto;|g' anykernel.sh
         
-        # 2. 执行修改：关闭设备检查
+        # 3. 修正设备检查开关 (properties 函数内的小写项)
         sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
         
-        # 3. 核心校验逻辑：如果文件中找不到 "block=auto;"，说明 sed 没成功
-        if grep -q "block=auto;" anykernel.sh; then
-            echo "✅ SUCCESS: AnyKernel3 block partition set to auto."
+        # 4. 校验结果
+        echo "--- Checking anykernel.sh content ---"
+        if grep -q "BLOCK=auto;" anykernel.sh; then
+            echo "✅ SUCCESS: BLOCK partition set to auto."
         else
-            echo "❌ ERROR: Failed to modify anykernel.sh. The script still contains the old OMAP path."
+            echo "❌ ERROR: Failed to modify BLOCK path. Check anykernel.sh content above."
+            grep "BLOCK=" anykernel.sh || true
             exit 1
         fi
 
@@ -120,7 +122,6 @@ jobs:
             exit 1
         fi
         
-        # 返回上级目录，保留 AnyKernel3 文件夹供后续打包使用
         cd ..
 
     - name: Build Kernel
