@@ -1,5 +1,4 @@
 name: Build Surya Kernel
-
 on:
   workflow_dispatch:
 
@@ -27,45 +26,75 @@ jobs:
         ./antman -S
         ./antman --patch=glibc
 
-    - name: KernelSU Setup & Docker Configuration
+    - name: KernelSU v0.9.5 & Docker Integration
       run: |
-        # --- 1. KernelSU 安装 (保持你原来的方式) ---
-        # 使用 setup.sh 自动 Patch 内核源码
-        curl -LSs "https://raw.githubusercontent.com/tiann/KernelSU/main/kernel/setup.sh" | bash -s main
+        # --- 1. 清理环境 (至关重要) ---
+        # 确保源码是纯净的，撤销 setup.sh 可能留下的任何修改
+        # 这一步能解决 "undefined symbol: ksu_input_hook"
+        git checkout .
+        make mrproper
+        rm -rf out
+        mkdir -p out
 
-        # --- 2. 核心修复：使用 merge_config.sh 注入 Docker 配置 ---
-        # 我们不再修改 surya_defconfig，而是创建一个覆盖文件
+        # --- 2. 手动集成 KernelSU v0.9.5 (稳定版) ---
+        rm -rf drivers/kernelsu
+        # 使用 v0.9.5，这是最适合 Android 4.14 内核的版本
+        git clone --depth=1 --branch v0.9.5 https://github.com/tiann/KernelSU ksu_temp
         
-        cat <<EOF > docker_overlay.config
-        # ==============================================
-        # Docker 核心依赖 (解决 missing 的关键)
-        # ==============================================
-        # 基础 IPC 设施 (Docker 必须)
+        # 部署代码
+        mkdir -p drivers/kernelsu
+        cp -r ksu_temp/kernel/* drivers/kernelsu/
+        rm -rf ksu_temp
+
+        # 手动注册驱动 (仅作为模块编译，不修改 fs/exec.c)
+        echo "obj-y += kernelsu/" >> drivers/Makefile
+        sed -i "/endmenu/i source \"drivers/kernelsu/Kconfig\"" drivers/Kconfig
+
+        # 修复 v0.9.5 在 4.14 上唯一的编译报错 (MODULE_IMPORT_NS)
+        sed -i '1i #include <linux/version.h>\n#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 4, 0)\n#define MODULE_IMPORT_NS(ns)\n#endif' drivers/kernelsu/ksu.c
+
+        # --- 3. 创建 Docker + KSU 配置文件 ---
+        # 参考 daoudeddy 的配置清单，整合为 merge fragment
+        cat <<EOF > docker_ksu.config
+        # ==========================================
+        # KernelSU (Kprobes 模式)
+        # ==========================================
+        CONFIG_KSU=y
+        CONFIG_KPROBES=y
+        CONFIG_HAVE_KPROBES=y
+        CONFIG_KPROBE_EVENTS=y
+        CONFIG_OVERLAY_FS=y
+
+        # ==========================================
+        # Docker 核心组件 (参考 daoudeddy)
+        # ==========================================
+        # 1. Namespaces (必须全开)
+        CONFIG_NAMESPACES=y
+        CONFIG_NET_NS=y
+        CONFIG_PID_NS=y
+        CONFIG_IPC_NS=y
+        CONFIG_UTS_NS=y
+        CONFIG_USER_NS=y
+        
+        # 2. 基础 IPC (Docker 运行的前提)
         CONFIG_SYSVIPC=y
         CONFIG_POSIX_MQUEUE=y
+        CONFIG_KEYS=y
         
-        # Namespaces (Docker 容器隔离必须)
-        CONFIG_NAMESPACES=y
-        CONFIG_UTS_NS=y
-        CONFIG_IPC_NS=y
-        CONFIG_USER_NS=y
-        CONFIG_PID_NS=y
-        CONFIG_NET_NS=y
-        
-        # Cgroups (资源限制必须)
+        # 3. Cgroups (资源隔离)
         CONFIG_CGROUPS=y
+        CONFIG_CGROUP_CPUACCT=y
+        CONFIG_CGROUP_DEVICE=y
+        CONFIG_CGROUP_FREEZER=y
+        CONFIG_CGROUP_SCHED=y
+        CONFIG_CGROUP_PIDS=y
+        CONFIG_CPUSETS=y
         CONFIG_MEMCG=y
         CONFIG_MEMCG_SWAP=y
         CONFIG_BLK_CGROUP=y
-        CONFIG_CGROUP_SCHED=y
-        CONFIG_CGROUP_PIDS=y
-        CONFIG_CGROUP_FREEZER=y
-        CONFIG_CGROUP_DEVICE=y
-        CONFIG_CPUSETS=y
-        CONFIG_CGROUP_CPUACCT=y
         CONFIG_CGROUP_BPF=y
 
-        # 网络虚拟化 (解决 veth/bridge missing)
+        # 4. 网络与 Netfilter (最容易 missing 的部分)
         CONFIG_BRIDGE=y
         CONFIG_BRIDGE_NETFILTER=y
         CONFIG_VETH=y
@@ -76,42 +105,30 @@ jobs:
         CONFIG_IP_NF_TARGET_MASQUERADE=y
         CONFIG_NF_NAT=y
         CONFIG_NF_NAT_IPV4=y
+        CONFIG_IP_NF_FILTER=y
+        CONFIG_IP_NF_TARGET_REJECT=y
+        CONFIG_IP_VS=y
         
-        # 文件系统
-        CONFIG_OVERLAY_FS=y
-
-        # ==============================================
-        # Android 特有修复
-        # ==============================================
-        # 关闭这个选项，否则 Docker 容器内无法联网
+        # 5. 高级网络 (可选但建议)
+        CONFIG_MACVLAN=y
+        CONFIG_VXLAN=y
+        CONFIG_IPVLAN=y
+        
+        # ==========================================
+        # 关键修正
+        # ==========================================
+        # [Fix 1] 允许 Docker 容器访问外网 (Android 特有限制)
         # CONFIG_ANDROID_PARANOID_NETWORK is not set
         
-        # ==============================================
-        # KernelSU 配置
-        # ==============================================
-        CONFIG_KSU=y
-        # 开启 Kprobes 以增强兼容性
-        CONFIG_KPROBES=y
-        CONFIG_HAVE_KPROBES=y
-        CONFIG_KPROBE_EVENTS=y
-        
-        # 禁用 LTO (防止符号优化导致 KSU 失效)
+        # [Fix 2] 禁用 LTO (KernelSU Kprobes 必须)
         # CONFIG_LTO_CLANG is not set
         # CONFIG_LTO_CLANG_THIN is not set
         EOF
 
-        # --- 3. 清理与合并 ---
-        # 清理之前的构建残留
-        make mrproper
-        
-        # 创建输出目录
-        mkdir -p out
-        
-        # 【关键步骤】
-        # 使用官方脚本将 surya_defconfig 和我们的 docker_overlay.config 合并
-        # 结果直接生成到 out/.config，自动处理依赖关系
+        # --- 4. 合并配置 (Magic happens here) ---
+        # 使用内核脚本自动处理依赖，将 surya_defconfig 和 docker_ksu.config 合并
         export ARCH=arm64
-        scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_overlay.config
+        scripts/kconfig/merge_config.sh -m -O out arch/arm64/configs/surya_defconfig docker_ksu.config
 
     - name: Build Kernel
       run: |
@@ -119,26 +136,24 @@ jobs:
         export ARCH=arm64
         export SUBARCH=arm64
         
-        # 此时 out/.config 已经由 merge_config.sh 生成好了
-        # 我们只需要运行 olddefconfig 确认一下默认值
+        # 生成最终 .config
         make O=out LLVM=1 LLVM_IAS=1 olddefconfig
         
-        # 检查一下配置是否真的进去了 (调试用)
-        echo "Checking CONFIG_SYSVIPC..."
-        grep "CONFIG_SYSVIPC" out/.config || true
-        echo "Checking CONFIG_IPC_NS..."
-        grep "CONFIG_IPC_NS" out/.config || true
-        echo "Checking CONFIG_KSU..."
-        grep "CONFIG_KSU" out/.config || true
+        # 验证关键配置是否生效 (如果这里输出为空，说明配置没进去)
+        echo "=== Config Check ==="
+        grep "CONFIG_KSU" out/.config
+        grep "CONFIG_IPC_NS" out/.config
+        grep "CONFIG_BRIDGE" out/.config
+        echo "===================="
 
-        # 开始编译
+        # 编译
         make -j$(nproc --all) O=out \
           LLVM=1 \
           LLVM_IAS=1 \
           CC=clang \
           CROSS_COMPILE=aarch64-linux-gnu- \
           CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-          LOCALVERSION="-Docker-Fixed" \
+          LOCALVERSION="-Docker-KSU-Final" \
           Image.gz-dtb dtbo.img
 
     - name: Package with AnyKernel3
@@ -152,7 +167,7 @@ jobs:
         cat <<EOF > AnyKernel3/anykernel.sh
         # AnyKernel3 Ramdisk Mod Script
         properties() { '
-        kernel.string=Docker-Surya-Fixed
+        kernel.string=Surya-Docker-KSU-v0.9.5
         do.devicecheck=0
         do.modules=0
         do.systemless=0
@@ -173,10 +188,10 @@ jobs:
         EOF
         
         cd AnyKernel3
-        zip -r9 ../Surya-Docker-Final.zip *
+        zip -r9 ../Surya-Docker-KSU.zip *
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: Surya-Docker-Final
-        path: Surya-Docker-Final.zip
+        name: Surya-Docker-KSU
+        path: Surya-Docker-KSU.zip
