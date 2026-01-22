@@ -92,6 +92,37 @@ jobs:
         CONFIG_IKCONFIG_PROC=y
         EOF
 
+    - name: Pre-check AnyKernel3 Logic (Fail Fast)
+      run: |
+        # 提前克隆 AnyKernel3 进行逻辑校验
+        git clone https://github.com/osm0sis/AnyKernel3.git
+        cd AnyKernel3
+        
+        # 1. 执行修改：强制将 block 路径改为 auto
+        # 注意：这里使用精准匹配原始字符串，确保替换成功
+        sed -i 's|block=/dev/block/platform/omap/omap_hsmmc.0/by-name/boot;|block=auto;|g' anykernel.sh
+        
+        # 2. 执行修改：关闭设备检查
+        sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+        
+        # 3. 核心校验逻辑：如果文件中找不到 "block=auto;"，说明 sed 没成功
+        if grep -q "block=auto;" anykernel.sh; then
+            echo "✅ SUCCESS: AnyKernel3 block partition set to auto."
+        else
+            echo "❌ ERROR: Failed to modify anykernel.sh. The script still contains the old OMAP path."
+            exit 1
+        fi
+
+        if grep -q "do.devicecheck=0" anykernel.sh; then
+            echo "✅ SUCCESS: Device check disabled."
+        else
+            echo "❌ ERROR: Failed to disable device check."
+            exit 1
+        fi
+        
+        # 返回上级目录，保留 AnyKernel3 文件夹供后续打包使用
+        cd ..
+
     - name: Build Kernel
       run: |
         export PATH=$GITHUB_WORKSPACE/clang/bin:$PATH
@@ -110,20 +141,19 @@ jobs:
 
     - name: Package with AnyKernel3
       run: |
-        git clone https://github.com/osm0sis/AnyKernel3.git
-        rm -rf AnyKernel3/.git
-
-        # 复制产物
-        cp out/arch/arm64/boot/Image.gz-dtb AnyKernel3/
-        [ -f "out/arch/arm64/boot/dtbo.img" ] && cp out/arch/arm64/boot/dtbo.img AnyKernel3/
-
+        # 进入之前已经修改并校验过的目录
         cd AnyKernel3
-        # 强制设置 AnyKernel3 参数
-        sed -i 's/^block=.*/block=auto;/g' anykernel.sh
-        sed -i 's/^do.devicecheck=.*/do.devicecheck=0;/g' anykernel.sh
+        
+        # 拷贝编译产物
+        cp ../out/arch/arm64/boot/Image.gz-dtb .
+        if [ -f "../out/arch/arm64/boot/dtbo.img" ]; then
+          cp ../out/arch/arm64/boot/dtbo.img .
+        fi
+        
+        # 修改内核名称标识（这一步不影响刷入，可做可不做）
         sed -i 's/kernel.string=.*/kernel.string=Docker-KSU-Surya-A16/g' anykernel.sh
         
-        # 针对 A16 的重要补充：如果 Recovery 比较新，尝试直接刷入
+        # 直接打包
         zip -r9 ../Surya-Docker-KSU-Kernel-A16.zip *
 
     - name: Upload Artifact
